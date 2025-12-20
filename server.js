@@ -373,9 +373,19 @@ io.on('connection', (socket) => {
         messageId: message._id,
         chatId: chat._id,
         content: message.content, // Add content for temp ID mapping
-        status: 'sent' // Add status for WhatsApp-like indicators
+        status: 'sent', // Add status for WhatsApp-like indicators
+        timestamp: message.timestamp.toISOString() // Add timestamp for proper sorting
       });
-
+      
+      // Emit global chat update for sender's chat list
+      socket.emit('chat_updated', {
+        type: 'new_message',
+        chatId: chat._id.toString(),
+        senderId: socket.userId,
+        senderName: socket.userInfo.fullName,
+        lastMessage: message.content,
+        timestamp: message.timestamp.toISOString()
+      });
       // Find receiver's socket and send message in real-time
       const receiverSocket = Array.from(io.sockets.sockets.values())
         .find(s => s.userId === receiverId);
@@ -406,7 +416,8 @@ io.on('connection', (socket) => {
         chatId: chat._id.toString(),
         content: message.content, // Add content for temp ID mapping
         delivered: !!receiverSocket,
-        status: receiverSocket ? 'delivered' : 'sent' // Update status based on delivery
+        status: receiverSocket ? 'delivered' : 'sent', // Update status based on delivery
+        timestamp: message.timestamp.toISOString() // Add timestamp for proper sorting
       });
 
     } catch (error) {
@@ -469,9 +480,63 @@ io.on('connection', (socket) => {
     }
   });
 
+  // Handle typing status
+  socket.on('typing', (data) => {
+    try {
+      const { receiverId, isTyping, chatId } = data;
+      
+      console.log(`📝 ${socket.userInfo.fullName} typing status: ${isTyping} to ${receiverId}`);
+      
+      // Find receiver's socket and send typing status
+      const receiverSocket = Array.from(io.sockets.sockets.values())
+        .find(s => s.userId === receiverId);
+        
+      if (receiverSocket) {
+        receiverSocket.emit('typing', {
+          senderId: socket.userId,
+          senderName: socket.userInfo.fullName,
+          isTyping: isTyping,
+          chatId: chatId
+        });
+        console.log(`✅ Typing status sent to receiver: ${receiverId}`);
+      } else {
+        console.log(`📱 Receiver ${receiverId} not online for typing status`);
+      }
+      
+    } catch (error) {
+      console.error('Error handling typing status:', error);
+    }
+  });
+
+  // Handle user online status (when they connect/disconnect)
+  socket.on('user_status', (data) => {
+    try {
+      const { isOnline } = data;
+      
+      console.log(`🟢 ${socket.userInfo.fullName} status: ${isOnline ? 'online' : 'offline'}`);
+      
+      // Broadcast online status to all connected users
+      socket.broadcast.emit('user_online', {
+        userId: socket.userId,
+        userName: socket.userInfo.fullName,
+        isOnline: isOnline
+      });
+      
+    } catch (error) {
+      console.error('Error handling user status:', error);
+    }
+  });
+
   // Handle disconnection
   socket.on('disconnect', () => {
     console.log(`🔌 User disconnected: ${socket.userInfo.fullName} (${socket.userId})`);
+    
+    // Broadcast offline status to all connected users
+    socket.broadcast.emit('user_online', {
+      userId: socket.userId,
+      userName: socket.userInfo.fullName,
+      isOnline: false
+    });
   });
 
   // Handle errors
