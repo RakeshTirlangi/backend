@@ -182,16 +182,42 @@ app.get('/api/chats/:chatId/messages', async (req, res) => {
       .sort({ timestamp: 1 }); // Oldest first
 
     // Format messages for frontend
-    const formattedMessages = messages.map(message => ({
-      id: message._id.toString(),
-      content: message.content,
-      senderId: message.sender._id.toString(),
-      senderName: message.sender.fullName,
-      timestamp: message.timestamp,
-      isMe: message.sender._id.toString() === userId,
-      messageType: 'text',
-      chatId: chatId
-    }));
+    const formattedMessages = messages.map(message => {
+      const isMe = message.sender._id.toString() === userId;
+      
+      // ✅ DEBUGGING: Log message read status
+      console.log(`📊 Message ${message._id}: isRead=${message.isRead}, readAt=${message.readAt}, deliveredAt=${message.deliveredAt}, isMe=${isMe}`);
+      
+      // ✅ FIXED: Correct status calculation based on user perspective
+      let status;
+      if (isMe) {
+        // For messages I sent: check if receiver read it
+        // The message.isRead field indicates if the RECEIVER read it
+        status = message.isRead ? 'read' : (message.deliveredAt ? 'delivered' : 'sent');
+        console.log(`📤 Sent message status: ${status} (isRead: ${message.isRead})`);
+      } else {
+        // For messages I received: check if I (current user) read it
+        // Since I'm loading the messages, they are at least delivered to me
+        status = 'delivered'; // For now, received messages show as delivered
+        console.log(`📥 Received message status: ${status}`);
+      }
+      
+      return {
+        id: message._id.toString(),
+        content: message.content,
+        senderId: message.sender._id.toString(),
+        senderName: message.sender.fullName,
+        timestamp: message.timestamp,
+        isMe: isMe,
+        messageType: 'text',
+        chatId: chatId,
+        // Include read status from database
+        isRead: message.isRead || false,
+        readAt: message.readAt,
+        deliveredAt: message.deliveredAt,
+        status: status
+      };
+    });
 
     console.log(`✅ Found ${formattedMessages.length} messages for chat ${chatId}`);
 
@@ -309,7 +335,7 @@ io.on('connection', (socket) => {
     socket.emit('test_response', { message: 'Connection test successful!' });
   });
 
-  // Handle sending messages - SIMPLE VERSION (only save to DB)
+  // Handle sending messages - WITH REAL-TIME DELIVERY
   socket.on('send_message', async (data) => {
     try {
       const { receiverId, content } = data;
@@ -330,18 +356,57 @@ io.on('connection', (socket) => {
         chatId: chat._id,
         sender: socket.userId,
         receiver: receiverId,
-        content: content.trim()
+        content: content.trim(),
+        deliveredAt: new Date() // Mark as delivered when saved
       });
 
       await message.save();
       
+      // Populate sender info for real-time delivery
+      await message.populate('sender', 'fullName userId');
+      
       console.log(`✅ Message saved to database - Chat: ${chat._id}`);
 
-      // Send confirmation back to sender only
+      // Send confirmation back to sender
       socket.emit('message_sent', {
         success: true,
         messageId: message._id,
-        chatId: chat._id
+        chatId: chat._id,
+        content: message.content, // Add content for temp ID mapping
+        status: 'sent' // Add status for WhatsApp-like indicators
+      });
+
+      // Find receiver's socket and send message in real-time
+      const receiverSocket = Array.from(io.sockets.sockets.values())
+        .find(s => s.userId === receiverId);
+
+      if (receiverSocket) {
+        console.log(`📥 Delivering message to receiver: ${receiverId}`);
+        const messageData = {
+          id: message._id.toString(),
+          content: message.content,
+          senderId: socket.userId,
+          senderName: socket.userInfo.fullName,
+          // Send timestamp in ISO format with UTC timezone for consistency
+          timestamp: message.timestamp.toISOString(),
+          chatId: chat._id.toString(),
+          receiverId: receiverId,
+          status: 'delivered' // Mark as delivered when sent to recipient
+        };
+        
+        receiverSocket.emit('new_message', messageData);
+        console.log(`✅ Message delivered to receiver in real-time:`, messageData);
+      } else {
+        console.log(`📱 Receiver ${receiverId} not online - message saved for later`);
+      }
+
+      // Also send to sender for confirmation (optional)
+      socket.emit('message_delivered', {
+        messageId: message._id.toString(),
+        chatId: chat._id.toString(),
+        content: message.content, // Add content for temp ID mapping
+        delivered: !!receiverSocket,
+        status: receiverSocket ? 'delivered' : 'sent' // Update status based on delivery
       });
 
     } catch (error) {
@@ -350,6 +415,57 @@ io.on('connection', (socket) => {
         success: false,
         error: 'Failed to send message'
       });
+    }
+  });
+
+  // Handle message read status
+  socket.on('message_read', async (data) => {
+    try {
+      const { messageId, chatId } = data;
+      
+      console.log(`👁️ Message read by ${socket.userInfo.fullName}: ${messageId}`);
+      
+      // Find sender's socket to notify them that their message was read
+      // First, find the message to get the sender ID
+      const message = await Message.findById(messageId);
+      if (!message) {
+        console.log('❌ Message not found for read status');
+        return;
+      }
+      
+      // ✅ NEW: Persist read status to database (WhatsApp-like behavior)
+      if (!message.isRead) {
+        console.log(`💾 Updating message ${messageId} read status in database...`);
+        const updatedMessage = await Message.findByIdAndUpdate(messageId, {
+          isRead: true,
+          readAt: new Date()
+        }, { new: true });
+        console.log(`✅ Message marked as read in database: ${messageId}`);
+        console.log(`📊 Updated message status - isRead: ${updatedMessage.isRead}, readAt: ${updatedMessage.readAt}`);
+        console.log(`📊 Original message - sender: ${message.sender}, receiver: ${message.receiver}`);
+      } else {
+        console.log(`ℹ️ Message ${messageId} was already marked as read`);
+      }
+      
+      // Notify the sender that their message was read
+      const senderSocket = Array.from(io.sockets.sockets.values())
+        .find(s => s.userId === message.sender.toString());
+        
+      if (senderSocket) {
+        console.log(`✅ Notifying sender that message was read: ${message.sender}`);
+        senderSocket.emit('message_read', {
+          messageId: messageId,
+          chatId: chatId,
+          readerId: socket.userId,
+          readerName: socket.userInfo.fullName,
+          timestamp: new Date().toISOString()
+        });
+      } else {
+        console.log(`📱 Sender not online to receive read notification`);
+      }
+      
+    } catch (error) {
+      console.error('Error handling message read:', error);
     }
   });
 
