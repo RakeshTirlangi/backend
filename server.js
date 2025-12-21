@@ -81,6 +81,79 @@ app.post('/api/messages/send', async (req, res) => {
   }
 });
 
+// Delivery acknowledgment endpoint - Enhanced for better reliability
+app.post('/api/messages/:id/delivered', async (req, res) => {
+  try {
+    // Extract token from Authorization header
+    const token = req.header('Authorization')?.replace('Bearer ', '');
+    if (!token) {
+      return res.status(401).json({ success: false, message: 'No token provided' });
+    }
+
+    // Verify token
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    const userId = decoded.userId;
+    const messageId = req.params.id;
+
+    console.log(`📦 Manual delivery acknowledgment for message: ${messageId} by user: ${userId}`);
+
+    // ✅ FIX: Only update if message is still in 'sent' status (avoid overwriting 'read' status)
+    const updatedMessage = await Message.findOneAndUpdate(
+      {
+        _id: messageId,
+        status: 'sent' // Only update if still in sent status
+      },
+      {
+        status: 'delivered',
+        deliveredAt: new Date()
+      },
+      { new: true }
+    );
+
+    if (!updatedMessage) {
+      // Message might already be delivered or read, or doesn't exist
+      const existingMessage = await Message.findById(messageId);
+      if (!existingMessage) {
+        return res.status(404).json({ success: false, message: 'Message not found' });
+      }
+      
+      console.log(`📦 Message ${messageId} already has status: ${existingMessage.status}`);
+      return res.json({
+        success: true,
+        message: 'Message status already updated',
+        messageId: messageId,
+        currentStatus: existingMessage.status
+      });
+    }
+
+    // Notify sender about delivery status change
+    const senderSocket = Array.from(io.sockets.sockets.values())
+      .find(s => s.userId === updatedMessage.sender.toString());
+
+    if (senderSocket) {
+      senderSocket.emit('message_delivered', {
+        messageId: messageId,
+        status: 'delivered',
+        deliveredAt: updatedMessage.deliveredAt.toISOString()
+      });
+      console.log(`✅ Delivery status sent to sender: ${updatedMessage.sender}`);
+    } else {
+      console.log(`📱 Sender not online to receive delivery notification`);
+    }
+
+    res.json({
+      success: true,
+      message: 'Message marked as delivered',
+      messageId: messageId,
+      status: 'delivered'
+    });
+
+  } catch (error) {
+    console.error('❌ Delivery acknowledgment error:', error);
+    res.status(500).json({ success: false, message: 'Failed to acknowledge delivery' });
+  }
+});
+
 // Get user's chats with last message info
 app.get('/api/chats', async (req, res) => {
   try {
@@ -185,27 +258,6 @@ app.get('/api/chats/:chatId/messages', async (req, res) => {
     const formattedMessages = messages.map(message => {
       const isMe = message.sender._id.toString() === userId;
       
-      // ✅ DEBUGGING: Log message read status
-      console.log(`📊 Message ${message._id}: isRead=${message.isRead}, readAt=${message.readAt}, deliveredAt=${message.deliveredAt}, isMe=${isMe}`);
-      
-      // ✅ ENHANCED: WhatsApp-like status calculation with proper delivery tracking
-      let status;
-      if (isMe) {
-        // For messages I sent: check delivery and read status properly
-        if (message.isRead) {
-          status = 'read'; // Double blue ticks - receiver read the message
-        } else if (message.deliveredAt) {
-          status = 'delivered'; // Double gray ticks - message delivered to receiver
-        } else {
-          status = 'sent'; // Single gray tick - message sent but not yet delivered
-        }
-        console.log(`📤 Sent message status: ${status} (isRead: ${message.isRead}, deliveredAt: ${message.deliveredAt})`);
-      } else {
-        // For messages I received: they are delivered to me (since I'm loading them)
-        status = 'delivered'; // For received messages, always show as delivered
-        console.log(`📥 Received message status: ${status}`);
-      }
-      
       return {
         id: message._id.toString(),
         content: message.content,
@@ -218,8 +270,6 @@ app.get('/api/chats/:chatId/messages', async (req, res) => {
         // Include read status from database
         isRead: message.isRead || false,
         readAt: message.readAt,
-        deliveredAt: message.deliveredAt,
-        status: status
       };
     });
 
@@ -287,6 +337,26 @@ app.post('/api/chats/create', async (req, res) => {
   }
 });
 
+// Get online status endpoint
+app.get('/api/users/:userId/status', async (req, res) => {
+  try {
+    const userId = req.params.userId;
+    
+    // Check if user is in online users set
+    const isOnline = global.onlineUsers ? global.onlineUsers.has(userId) : false;
+    
+    res.json({
+      success: true,
+      userId: userId,
+      status: isOnline ? 'online' : 'offline',
+      timestamp: new Date().toISOString()
+    });
+  } catch (error) {
+    console.error('❌ Get user status error:', error);
+    res.status(500).json({ success: false, message: 'Failed to get user status' });
+  }
+});
+
 // Health check endpoint
 app.get('/health', (req, res) => {
   res.json({ message: 'Server is running!' });
@@ -311,7 +381,7 @@ io.use(async (socket, next) => {
     
     if (!user) {
       console.log('❌ User not found for ID:', decoded.userId);
-      return next(new Error('User not found'));
+      return next(new Error('User not found - please login again'));
     }
 
     socket.userId = user._id.toString();
@@ -329,49 +399,48 @@ io.use(async (socket, next) => {
   }
 });
 
-// ✅ NEW: Helper function to update pending messages to delivered when user comes online
-async function _updatePendingMessagesToDelivered(userId) {
+// ✅ ENHANCED: Helper function when user comes online (simplified)
+async function _updateUserOnlineStatus(userId) {
   try {
-    console.log(`📦 Updating pending messages to delivered for user: ${userId}`);
-    
-    // Find all messages sent to this user that haven't been delivered yet
-    const pendingMessages = await Message.find({
-      receiver: userId,
-      deliveredAt: null // Messages not yet marked as delivered
-    }).populate('sender', 'fullName userId');
-    
-    if (pendingMessages.length > 0) {
-      console.log(`📦 Found ${pendingMessages.length} pending messages to mark as delivered`);
-      
-      // Update all pending messages to delivered
-      await Message.updateMany(
-        { receiver: userId, deliveredAt: null },
-        { deliveredAt: new Date() }
-      );
-      
-      // Notify senders that their messages are now delivered
-      for (const message of pendingMessages) {
-        const senderSocket = Array.from(io.sockets.sockets.values())
-          .find(s => s.userId === message.sender._id.toString());
-          
-        if (senderSocket) {
-          senderSocket.emit('message_delivered', {
-            messageId: message._id.toString(),
-            chatId: message.chatId.toString(),
-            content: message.content,
-            status: 'delivered',
-            timestamp: message.timestamp.toISOString()
-          });
-          console.log(`✅ Notified sender ${message.sender.fullName} that message was delivered`);
-        }
-      }
-      
-      console.log(`✅ Updated ${pendingMessages.length} messages to delivered status`);
-    } else {
-      console.log(`ℹ️ No pending messages found for user ${userId}`);
+    console.log(`📦 User ${userId} came online`);
+    // Store online users in memory (simple approach)
+    if (!global.onlineUsers) {
+      global.onlineUsers = new Set();
     }
+    global.onlineUsers.add(userId);
+    
+    // Broadcast online status to other connected users
+    io.emit('user_online', {
+      userId: userId,
+      status: 'online',
+      timestamp: new Date().toISOString()
+    });
+    
+    console.log(`✅ User online status updated for: ${userId}`);
   } catch (error) {
-    console.error('❌ Error updating pending messages to delivered:', error);
+    console.error('❌ Error updating user online status:', error);
+  }
+}
+
+// Helper function when user goes offline
+async function _updateUserOfflineStatus(userId) {
+  try {
+    console.log(`📦 User ${userId} went offline`);
+    // Remove from online users
+    if (global.onlineUsers) {
+      global.onlineUsers.delete(userId);
+    }
+    
+    // Broadcast offline status to other connected users
+    io.emit('user_offline', {
+      userId: userId,
+      status: 'offline',
+      timestamp: new Date().toISOString()
+    });
+    
+    console.log(`✅ User offline status updated for: ${userId}`);
+  } catch (error) {
+    console.error('❌ Error updating user offline status:', error);
   }
 }
 
@@ -379,8 +448,11 @@ async function _updatePendingMessagesToDelivered(userId) {
 io.on('connection', (socket) => {
   console.log(`🔌 User connected: ${socket.userInfo.fullName} (${socket.userId})`);
 
-  // ✅ NEW: Update delivery status for pending messages when user comes online
-  _updatePendingMessagesToDelivered(socket.userId);
+  // ✅ ENHANCED: Update user status when they connect
+  // This runs every time user connects/reconnects
+  setTimeout(() => {
+    _updateUserOnlineStatus(socket.userId);
+  }, 1000); // Small delay to ensure connection is stable
 
   // Test connection handler
   socket.on('test_connection', (data) => {
@@ -404,14 +476,13 @@ io.on('connection', (socket) => {
       // Find or create chat between sender and receiver
       const chat = await Chat.findOrCreateChat(socket.userId, receiverId);
 
-      // Create and save message
+      // Create and save message with initial status
       const message = new Message({
         chatId: chat._id,
         sender: socket.userId,
         receiver: receiverId,
         content: content.trim(),
-        // ✅ FIXED: Don't set deliveredAt on creation, only when actually delivered
-        deliveredAt: null // Will be set when message is actually delivered to receiver
+        status: 'sent'
       });
 
       await message.save();
@@ -427,7 +498,6 @@ io.on('connection', (socket) => {
         messageId: message._id,
         chatId: chat._id,
         content: message.content, // Add content for temp ID mapping
-        status: 'sent', // Add status for WhatsApp-like indicators
         timestamp: message.timestamp.toISOString() // Add timestamp for proper sorting
       });
       
@@ -447,11 +517,6 @@ io.on('connection', (socket) => {
       if (receiverSocket) {
         console.log(`📥 Delivering message to receiver: ${receiverId}`);
         
-        // ✅ ENHANCED: Mark message as delivered when actually sent to receiver
-        await Message.findByIdAndUpdate(message._id, {
-          deliveredAt: new Date()
-        });
-        
         const messageData = {
           id: message._id.toString(),
           content: message.content,
@@ -461,22 +526,39 @@ io.on('connection', (socket) => {
           timestamp: message.timestamp.toISOString(),
           chatId: chat._id.toString(),
           receiverId: receiverId,
-          status: 'delivered' // Mark as delivered when sent to recipient
         };
         
-        receiverSocket.emit('new_message', messageData);
-        console.log(`✅ Message delivered to receiver in real-time and marked as delivered in DB`);
+        receiverSocket.emit('new_message', {...messageData, status: 'sent'});
+        console.log(`✅ Message delivered to receiver in real-time`);
+        
+        // ✅ FIX: Automatically mark message as delivered since it reached the recipient's device
+        try {
+          await Message.findByIdAndUpdate(message._id, {
+            status: 'delivered',
+            deliveredAt: new Date()
+          });
+          console.log(`📦 Message automatically marked as delivered: ${message._id}`);
+          
+          // Notify sender about delivery status change
+          socket.emit('message_delivered', {
+            messageId: message._id.toString(),
+            status: 'delivered',
+            deliveredAt: new Date().toISOString()
+          });
+          console.log(`✅ Delivery notification sent to sender: ${socket.userId}`);
+        } catch (deliveryError) {
+          console.error('❌ Error updating delivery status:', deliveryError);
+        }
       } else {
-        console.log(`📱 Receiver ${receiverId} not online - message will be delivered when they come online`);
+        console.log(`📱 Receiver ${receiverId} not online - message saved for later`);
       }
 
       // Also send to sender for confirmation (optional)
-      socket.emit('message_delivered', {
+      socket.emit('message_sent', {
         messageId: message._id.toString(),
         chatId: chat._id.toString(),
         content: message.content, // Add content for temp ID mapping
-        delivered: !!receiverSocket,
-        status: receiverSocket ? 'delivered' : 'sent', // Update status based on delivery
+        success: true,
         timestamp: message.timestamp.toISOString() // Add timestamp for proper sorting
       });
 
@@ -489,114 +571,193 @@ io.on('connection', (socket) => {
     }
   });
 
-  // Handle message read status
+  // Handle message read status - Enhanced with better status management
   socket.on('message_read', async (data) => {
     try {
-      const { messageId, chatId } = data;
+      const { chatId } = data;
       
-      console.log(`👁️ Message read by ${socket.userInfo.fullName}: ${messageId}`);
+      console.log(`👁️ Chat opened by ${socket.userInfo.fullName}: marking messages as read for chat ${chatId}`);
       
-      // Find sender's socket to notify them that their message was read
-      // First, find the message to get the sender ID
-      const message = await Message.findById(messageId);
-      if (!message) {
-        console.log('❌ Message not found for read status');
-        return;
-      }
-      
-      // ✅ NEW: Persist read status to database (WhatsApp-like behavior)
-      if (!message.isRead) {
-        console.log(`💾 Updating message ${messageId} read status in database...`);
-        const updatedMessage = await Message.findByIdAndUpdate(messageId, {
-          isRead: true,
-          readAt: new Date()
-        }, { new: true });
-        console.log(`✅ Message marked as read in database: ${messageId}`);
-        console.log(`📊 Updated message status - isRead: ${updatedMessage.isRead}, readAt: ${updatedMessage.readAt}`);
-        console.log(`📊 Original message - sender: ${message.sender}, receiver: ${message.receiver}`);
-      } else {
-        console.log(`ℹ️ Message ${messageId} was already marked as read`);
-      }
-      
-      // Notify the sender that their message was read
-      const senderSocket = Array.from(io.sockets.sockets.values())
-        .find(s => s.userId === message.sender.toString());
-        
-      if (senderSocket) {
-        console.log(`✅ Notifying sender that message was read: ${message.sender}`);
-        senderSocket.emit('message_read', {
-          messageId: messageId,
+      // ✅ FIX: Update all delivered messages in this chat to read status (don't touch sent messages)
+      const result = await Message.updateMany(
+        {
           chatId: chatId,
-          readerId: socket.userId,
-          readerName: socket.userInfo.fullName,
-          timestamp: new Date().toISOString()
-        });
-      } else {
-        console.log(`📱 Sender not online to receive read notification`);
+          receiver: socket.userId,
+          status: 'delivered' // Only update delivered messages to read
+        },
+        {
+          status: 'read',
+          readAt: new Date()
+        }
+      );
+      
+      console.log(`✅ Marked ${result.modifiedCount} delivered messages as read in chat ${chatId}`);
+      
+      // ✅ FIX: Also get recently sent messages that might need to be marked as delivered first
+      const recentSentMessages = await Message.find({
+        chatId: chatId,
+        receiver: socket.userId,
+        status: 'sent',
+        timestamp: { $gte: new Date(Date.now() - 60000) } // Last 1 minute
+      });
+      
+      if (recentSentMessages.length > 0) {
+        console.log(`📦 Found ${recentSentMessages.length} recent sent messages, marking as delivered then read`);
+        
+        // First mark as delivered
+        await Message.updateMany(
+          {
+            chatId: chatId,
+            receiver: socket.userId,
+            status: 'sent',
+            timestamp: { $gte: new Date(Date.now() - 60000) }
+          },
+          {
+            status: 'delivered',
+            deliveredAt: new Date()
+          }
+        );
+        
+        // Then immediately mark as read
+        await Message.updateMany(
+          {
+            chatId: chatId,
+            receiver: socket.userId,
+            status: 'delivered',
+            deliveredAt: { $gte: new Date(Date.now() - 5000) } // Just delivered
+          },
+          {
+            status: 'read',
+            readAt: new Date()
+          }
+        );
+        
+        console.log(`✅ Updated ${recentSentMessages.length} recent messages from sent -> delivered -> read`);
+      }
+      
+      // Notify sender about read status change for all affected messages
+      // Find all updated messages to get sender IDs
+      const updatedMessages = await Message.find({
+        chatId: chatId,
+        receiver: socket.userId,
+        status: 'read'
+      }).sort({ timestamp: -1 }).limit(100); // Limit to recent messages
+      
+      // Group by sender to avoid duplicate notifications
+      const senderIds = [...new Set(updatedMessages.map(msg => msg.sender.toString()))];
+      
+      for (const senderId of senderIds) {
+        const senderSocket = Array.from(io.sockets.sockets.values())
+          .find(s => s.userId === senderId);
+          
+        if (senderSocket) {
+          senderSocket.emit('message_read', {
+            chatId: chatId,
+            readerId: socket.userId,
+            readerName: socket.userInfo.fullName,
+            timestamp: new Date().toISOString(),
+            messageCount: updatedMessages.filter(msg => msg.sender.toString() === senderId).length
+          });
+          console.log(`✅ Read status sent to sender: ${senderId}`);
+        }
       }
       
     } catch (error) {
       console.error('Error handling message read:', error);
     }
   });
-
-  // Handle typing status
-  socket.on('typing', (data) => {
+  
+  // Read receipt endpoint - Enhanced with better status management
+  app.post('/api/messages/read', async (req, res) => {
     try {
-      const { receiverId, isTyping, chatId } = data;
-      
-      console.log(`📝 ${socket.userInfo.fullName} typing status: ${isTyping} to ${receiverId}`);
-      
-      // Find receiver's socket and send typing status
-      const receiverSocket = Array.from(io.sockets.sockets.values())
-        .find(s => s.userId === receiverId);
-        
-      if (receiverSocket) {
-        receiverSocket.emit('typing', {
-          senderId: socket.userId,
-          senderName: socket.userInfo.fullName,
-          isTyping: isTyping,
-          chatId: chatId
-        });
-        console.log(`✅ Typing status sent to receiver: ${receiverId}`);
-      } else {
-        console.log(`📱 Receiver ${receiverId} not online for typing status`);
+      // Extract token from Authorization header
+      const token = req.header('Authorization')?.replace('Bearer ', '');
+      if (!token) {
+        return res.status(401).json({ success: false, message: 'No token provided' });
       }
+  
+      // Verify token
+      const decoded = jwt.verify(token, process.env.JWT_SECRET);
+      const userId = decoded.userId;
+      const { chatId } = req.body;
+  
+      console.log(`👁️ HTTP Read receipt for chat: ${chatId} by user: ${userId}`);
+  
+      // ✅ FIX: First mark recent sent messages as delivered, then mark delivered messages as read
       
-    } catch (error) {
-      console.error('Error handling typing status:', error);
-    }
-  });
-
-  // Handle user online status (when they connect/disconnect)
-  socket.on('user_status', (data) => {
-    try {
-      const { isOnline } = data;
+      // Step 1: Mark recent sent messages as delivered
+      const recentSentResult = await Message.updateMany(
+        {
+          chatId: chatId,
+          receiver: userId,
+          status: 'sent',
+          timestamp: { $gte: new Date(Date.now() - 60000) } // Last 1 minute
+        },
+        {
+          status: 'delivered',
+          deliveredAt: new Date()
+        }
+      );
       
-      console.log(`🟢 ${socket.userInfo.fullName} status: ${isOnline ? 'online' : 'offline'}`);
+      console.log(`📦 Marked ${recentSentResult.modifiedCount} recent sent messages as delivered`);
       
-      // Broadcast online status to all connected users
-      socket.broadcast.emit('user_online', {
-        userId: socket.userId,
-        userName: socket.userInfo.fullName,
-        isOnline: isOnline
+      // Step 2: Mark all delivered messages as read
+      const readResult = await Message.updateMany(
+        {
+          chatId: chatId,
+          receiver: userId,
+          status: 'delivered'
+        },
+        {
+          status: 'read',
+          readAt: new Date()
+        }
+      );
+  
+      console.log(`✅ Marked ${readResult.modifiedCount} delivered messages as read in chat ${chatId}`);
+  
+      // Find the chat to get sender info and notify
+      const chat = await Chat.findById(chatId);
+      if (chat) {
+        // Get the other participant (sender)
+        const senderId = chat.participants.find(p => p.toString() !== userId);
+        
+        if (senderId) {
+          // Notify sender about read status change
+          const senderSocket = Array.from(io.sockets.sockets.values())
+            .find(s => s.userId === senderId.toString());
+            
+          if (senderSocket) {
+            senderSocket.emit('message_read', {
+              chatId: chatId,
+              readerId: userId,
+              timestamp: new Date().toISOString(),
+              messageCount: readResult.modifiedCount + recentSentResult.modifiedCount
+            });
+            console.log(`✅ Read status sent to sender: ${senderId}`);
+          }
+        }
+      }
+  
+      res.json({
+        success: true,
+        message: `Marked ${readResult.modifiedCount + recentSentResult.modifiedCount} messages as read`,
+        deliveredCount: recentSentResult.modifiedCount,
+        readCount: readResult.modifiedCount,
+        totalCount: readResult.modifiedCount + recentSentResult.modifiedCount
       });
-      
+  
     } catch (error) {
-      console.error('Error handling user status:', error);
+      console.error('❌ Read receipt error:', error);
+      res.status(500).json({ success: false, message: 'Failed to mark messages as read' });
     }
   });
 
   // Handle disconnection
   socket.on('disconnect', () => {
     console.log(`🔌 User disconnected: ${socket.userInfo.fullName} (${socket.userId})`);
-    
-    // Broadcast offline status to all connected users
-    socket.broadcast.emit('user_online', {
-      userId: socket.userId,
-      userName: socket.userInfo.fullName,
-      isOnline: false
-    });
+    // Update offline status when user disconnects
+    _updateUserOfflineStatus(socket.userId);
   });
 
   // Handle errors

@@ -562,6 +562,16 @@ router.get('/profile', verifyToken, async (req, res) => {
   }
 });
 
+// Logout endpoint (clears token on client side)
+router.post('/logout', (req, res) => {
+  // Since JWT tokens are stateless, we just send a success response
+  // The client should clear the token from storage
+  res.json({ 
+    success: true, 
+    message: 'Logged out successfully' 
+  });
+});
+
 // Get All Users with pagination and search
 router.get('/users', verifyToken, async (req, res) => {
   try {

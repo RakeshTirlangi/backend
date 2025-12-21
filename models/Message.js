@@ -24,16 +24,18 @@ const messageSchema = new mongoose.Schema({
     type: Date,
     default: Date.now
   },
-  // Add read status fields for WhatsApp-like behavior
-  isRead: {
-    type: Boolean,
-    default: false
+  // WhatsApp-style message status
+  status: {
+    type: String,
+    enum: ["sent", "delivered", "read"],
+    default: "sent"
   },
-  readAt: {
+  // Timestamps for status changes
+  deliveredAt: {
     type: Date,
     default: null
   },
-  deliveredAt: {
+  readAt: {
     type: Date,
     default: null
   }
